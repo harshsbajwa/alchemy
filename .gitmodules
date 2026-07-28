@@ -7,7 +7,7 @@
 	update = none
 [submodule "distilled"]
 	path = distilled
-	url = https://github.com/alchemy-run/distilled.git
+	url = https://github.com/harshsbajwa/distilled.git
 [submodule "cloudflare-tools"]
 	path = cloudflare-tools
 	url = https://github.com/alchemy-run/cloudflare-tools.git
