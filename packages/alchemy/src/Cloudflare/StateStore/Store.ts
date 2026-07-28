@@ -10,7 +10,14 @@ import { encodeState } from "../../State/StateEncoding.ts";
 import * as Secret from "../SecretsStore/index.ts";
 import { DurableObject } from "../Workers/DurableObject.ts";
 import { DurableObjectState } from "../Workers/DurableObjectState.ts";
-import { EncryptionKey } from "./Token.ts";
+import {
+  decryptStateEnvelope,
+  encryptStateEnvelope,
+  parseStateEncryptionKeyring,
+  StateEnvelopeError,
+  type StateEnvelopeContext,
+} from "./Encryption.ts";
+import { EncryptionKeyring } from "./Token.ts";
 
 export default class Store extends DurableObject<Store>()(
   "Store",
@@ -18,65 +25,73 @@ export default class Store extends DurableObject<Store>()(
     // Outer (class-level) phase — resolve the binding factory once.
     // The actual secret read happens inside each DO instance below,
     // since `SecretClient.get()` needs the per-instance worker env.
-    const encryptionSecret = yield* Secret.ReadSecret(EncryptionKey);
+    const encryptionSecret = yield* Secret.ReadSecret(EncryptionKeyring);
     const state = yield* DurableObjectState;
     const storage = state.storage;
 
     return Effect.gen(function* () {
-      const keyHex = yield* encryptionSecret
+      const encodedKeyring = yield* encryptionSecret
         .get()
         .pipe(Effect.map(Redacted.value), Effect.orDie);
-      const cryptoKey = yield* Effect.tryPromise(() =>
-        crypto.subtle.importKey(
-          "raw",
-          Buffer.from(keyHex, "hex"),
-          { name: "AES-CTR" },
-          false,
-          ["encrypt", "decrypt"],
-        ),
-      ).pipe(Effect.orDie);
+      const keyring = yield* Effect.try({
+        try: () => parseStateEncryptionKeyring(encodedKeyring),
+        catch: (cause) =>
+          cause instanceof StateEnvelopeError
+            ? cause
+            : new StateEnvelopeError({
+                message: "Unable to load the state encryption keyring.",
+                cause,
+              }),
+      }).pipe(Effect.orDie);
 
-      const encryptValue = (value: unknown) =>
-        Effect.tryPromise(async () => {
-          const plaintext = new TextEncoder().encode(
-            JSON.stringify(encodeState(value)),
-          );
-          const counter = crypto.getRandomValues(allocBytes(NONCE_BYTES));
-          const ct = new Uint8Array(
-            await crypto.subtle.encrypt(
-              { name: "AES-CTR", counter, length: 64 },
-              cryptoKey,
-              plaintext,
-            ),
-          );
-          // Frame as a single base64 string: nonce || ciphertext.
-          return Buffer.concat([counter, ct]).toString("base64");
+      const encryptEncodedValue = (
+        value: unknown,
+        context: StateEnvelopeContext,
+      ) =>
+        Effect.tryPromise({
+          try: () => encryptStateEnvelope(value, context, keyring),
+          catch: (cause) =>
+            cause instanceof StateEnvelopeError
+              ? cause
+              : new StateEnvelopeError({
+                  message: "Unable to encrypt state.",
+                  cause,
+                }),
         }).pipe(Effect.orDie);
 
-      const decryptEntry = (entry: string) =>
-        Effect.tryPromise(async () => {
-          const framed = Buffer.from(entry, "base64");
-          const counter = framed.subarray(0, NONCE_BYTES);
-          const ciphertext = framed.subarray(NONCE_BYTES);
-          let pt;
-          try {
-            pt = await crypto.subtle.decrypt(
-              { name: "AES-CTR", counter, length: 64 },
-              cryptoKey,
-              ciphertext,
-            );
-          } catch (error) {
-            // We return undefined here because in 2.0.0-beta.45, we rotated encryption keys unnecessarily.
-            // So, we catch a decryption error here and return undefined instead.
-            // The engine should reconcile, hopefully, but users may lose some data
-            console.error(
-              "Error decrypting entry. Returning undefined instead.",
-              error,
-            );
-            return undefined;
-          }
-          return JSON.parse(new TextDecoder().decode(pt)) as ResourceState;
+      const encryptValue = (value: unknown, context: StateEnvelopeContext) =>
+        encryptEncodedValue(encodeState(value), context);
+
+      const decryptEntry = (entry: string, context: StateEnvelopeContext) =>
+        Effect.tryPromise({
+          try: () => decryptStateEnvelope(entry, context, keyring),
+          catch: (cause) =>
+            cause instanceof StateEnvelopeError
+              ? cause
+              : new StateEnvelopeError({
+                  message:
+                    "State authentication failed; refusing to continue with missing state.",
+                  cause,
+                }),
         }).pipe(Effect.orDie);
+
+      const readEntry = (key: string, context: StateEnvelopeContext) =>
+        storage.get<string>(key).pipe(
+          Effect.flatMap((entry) => {
+            if (entry == null) return Effect.succeed(undefined);
+            return decryptEntry(entry, context).pipe(
+              Effect.flatMap(({ value, legacy }) =>
+                legacy
+                  ? encryptEncodedValue(value, context).pipe(
+                      Effect.flatMap((encrypted) =>
+                        storage.put(key, encrypted).pipe(Effect.as(value)),
+                      ),
+                    )
+                  : Effect.succeed(value),
+              ),
+            );
+          }),
+        );
 
       return {
         // -- Root DO methods -----------------------------------------
@@ -148,14 +163,18 @@ export default class Store extends DurableObject<Store>()(
          * (Stack DO only) Get a resource by (stage, fqn). Returns
          * null if missing.
          */
-        get: ({ stage, fqn }: { stage: string; fqn: string }) =>
-          storage
-            .get<string>(resourceKey(stage, fqn))
-            .pipe(
-              Effect.flatMap((entry) =>
-                entry == null ? Effect.succeed(undefined) : decryptEntry(entry),
-              ),
-            ),
+        get: ({
+          stack,
+          stage,
+          fqn,
+        }: {
+          stack: string;
+          stage: string;
+          fqn: string;
+        }) =>
+          readEntry(resourceKey(stage, fqn), { stack, stage, fqn }).pipe(
+            Effect.map((value) => value as ResourceState | undefined),
+          ),
 
         /**
          * (Stack DO only) Persist a resource. Returns the stored
@@ -163,14 +182,16 @@ export default class Store extends DurableObject<Store>()(
          */
         set: ({
           stage,
+          stack,
           fqn,
           value,
         }: {
+          stack: string;
           stage: string;
           fqn: string;
           value: ResourceState;
         }) =>
-          encryptValue(value).pipe(
+          encryptValue(value, { stack, stage, fqn }).pipe(
             Effect.flatMap((encrypted) =>
               storage
                 .put<string>(resourceKey(stage, fqn), encrypted)
@@ -208,21 +229,31 @@ export default class Store extends DurableObject<Store>()(
          * (Stack DO only) Read the persisted stack output for `stage`.
          * Returns `undefined` when the stage has not been deployed.
          */
-        getOutput: ({ stage }: { stage: string }) =>
-          storage
-            .get<string>(stackOutputKey(stage))
-            .pipe(
-              Effect.flatMap((entry) =>
-                entry == null ? Effect.succeed(undefined) : decryptEntry(entry),
-              ),
-            ),
+        getOutput: ({ stack, stage }: { stack: string; stage: string }) =>
+          readEntry(stackOutputKey(stage), {
+            stack,
+            stage,
+            fqn: STACK_OUTPUT_FQN,
+          }),
 
         /**
          * (Stack DO only) Persist the resolved stack output for
          * `stage`. Returns the stored value unchanged.
          */
-        setOutput: ({ stage, value }: { stage: string; value: any }) =>
-          encryptValue(value).pipe(
+        setOutput: ({
+          stack,
+          stage,
+          value,
+        }: {
+          stack: string;
+          stage: string;
+          value: any;
+        }) =>
+          encryptValue(value, {
+            stack,
+            stage,
+            fqn: STACK_OUTPUT_FQN,
+          }).pipe(
             Effect.flatMap((encrypted) =>
               storage
                 .put<string>(stackOutputKey(stage), encrypted)
@@ -236,19 +267,42 @@ export default class Store extends DurableObject<Store>()(
          * `status === "replaced"`. Each entry is decrypted so the
          * `status` field can be inspected.
          */
-        getReplacedResources: ({ stage }: { stage: string }) =>
+        getReplacedResources: ({
+          stack,
+          stage,
+        }: {
+          stack: string;
+          stage: string;
+        }) =>
           pipe(
             storage.list<string>({ prefix: stagePrefix(stage) }),
-            Effect.map((entries) =>
-              [...entries.values()].filter((e): e is string => !!e),
-            ),
-            Effect.flatMap(
-              Effect.forEach(decryptEntry, { concurrency: "unbounded" }),
+            Effect.flatMap((entries) =>
+              Effect.forEach(
+                entries.entries(),
+                ([key, entry]) => {
+                  const parsed = parseResourceKey(key);
+                  return parsed
+                    ? decryptEntry(entry, {
+                        stack,
+                        stage: parsed.stage,
+                        fqn: parsed.fqn,
+                      }).pipe(Effect.map(({ value }) => value))
+                    : Effect.succeed(undefined);
+                },
+                { concurrency: "unbounded" },
+              ),
             ),
             Effect.map((decoded) =>
-              decoded.filter(
-                (d): d is ReplacedResourceState => d?.status === "replaced",
-              ),
+              decoded.filter((value): value is ReplacedResourceState => {
+                if (
+                  typeof value !== "object" ||
+                  value === null ||
+                  !("status" in value)
+                ) {
+                  return false;
+                }
+                return value.status === "replaced";
+              }),
             ),
           ),
       };
@@ -275,8 +329,8 @@ const STACK_OUTPUT_PREFIX = `o${SEP}`;
 /** Key prefix for stack-index entries in the root DO. */
 const STACK_INDEX_PREFIX = "s:";
 
-/** AES-CTR counter block length. */
-const NONCE_BYTES = 16;
+/** Stable associated-data identity for a stage's stack output. */
+const STACK_OUTPUT_FQN = "__stack_output__";
 
 /** Build the resource key inside a *stack DO*. */
 const resourceKey = (stage: string, fqn: string) =>
@@ -301,11 +355,3 @@ const parseResourceKey = (
   if (sep < 0) return undefined;
   return { stage: rest.slice(0, sep), fqn: rest.slice(sep + 1) };
 };
-
-/**
- * Allocate a `Uint8Array` over a fresh `ArrayBuffer` (not shared) so
- * the resulting buffer satisfies Web Crypto's `BufferSource` type
- * constraint under strict DOM typings.
- */
-const allocBytes = (size: number): Uint8Array<ArrayBuffer> =>
-  new Uint8Array(new ArrayBuffer(size));

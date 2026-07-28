@@ -48,6 +48,8 @@ import {
 import {
   AuthToken,
   AuthTokenSecretName,
+  EncryptionKeyring,
+  EncryptionKeyringSecretName,
   EncryptionKeySecretName,
   TokenValue,
 } from "./Token.ts";
@@ -408,6 +410,7 @@ export const teardownStateStore = (options: TeardownOptions = {}) =>
     const ourSecretNames = new Set<string>([
       AuthTokenSecretName,
       EncryptionKeySecretName,
+      EncryptionKeyringSecretName,
     ]);
     const stores = yield* SecretsStore.listStores.items({ accountId }).pipe(
       Stream.runCollect,
@@ -503,6 +506,7 @@ const deployStateStore = ({
           const token = yield* TokenValue;
           const api = yield* Api;
           yield* AuthToken; // make sure it's in the Secrets Store
+          yield* EncryptionKeyring;
 
           // Surface the bearer token so tests and clients can authenticate
           // after deploy. The underlying value lives in the Cloudflare

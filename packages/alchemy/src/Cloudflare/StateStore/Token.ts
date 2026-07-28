@@ -1,5 +1,7 @@
 import { Random } from "../../Random.ts";
 import * as Effect from "effect/Effect";
+import * as Output from "../../Output.ts";
+import * as Redacted from "effect/Redacted";
 import * as Secret from "../SecretsStore/Secret.ts";
 import { Store as SecretsStore } from "../SecretsStore/SecretsStore.ts";
 
@@ -40,7 +42,7 @@ export const AuthToken = Effect.gen(function* () {
 
 /**
  * A 32-byte (256-bit) random value, hex-encoded, that seeds the
- * AES-CTR key used to encrypt resource state at rest. Generated once
+ * encryption key used to encrypt resource state at rest. Generated once
  * and persisted, so the ciphertext stored by the Durable Object can
  * always be decrypted by subsequent worker boots.
  */
@@ -52,10 +54,8 @@ export const EncryptionKeySecretName =
   "AlchemyStateStoreEncryptionKey" as const;
 
 /**
- * The encryption key secret. The raw hex-encoded bytes live inside
- * Cloudflare's Secrets Store; the Durable Object binds to it at
- * runtime to derive an AES-CTR `CryptoKey` via Web Crypto's
- * `subtle.importKey`.
+ * Legacy raw encryption-key secret retained while existing AES-CTR entries are
+ * migrated. New state-store Workers bind the versioned keyring below.
  */
 export const EncryptionKey = Effect.gen(function* () {
   const store = yield* Store;
@@ -64,5 +64,38 @@ export const EncryptionKey = Effect.gen(function* () {
     name: EncryptionKeySecretName,
     store,
     value: random.text,
+  });
+});
+
+export const EncryptionKeyringSecretName =
+  "AlchemyStateStoreEncryptionKeyring" as const;
+
+/**
+ * Versioned state-encryption keyring. A fresh installation starts with the
+ * original stable encryption key as `current`, so existing AES-CTR entries can
+ * be read and migrated in place. Rotation updates this document atomically:
+ * move the old current key to `previous`, install a new current key and keep
+ * both until every envelope has migrated.
+ */
+export const EncryptionKeyring = Effect.gen(function* () {
+  const store = yield* Store;
+  const random = yield* EncryptionKeyValue;
+  return yield* Secret.Secret("StateStoreEncryptionKeyring", {
+    name: EncryptionKeyringSecretName,
+    store,
+    value: random.text.pipe(
+      Output.map((text) => {
+        const keyHex = Redacted.value(text);
+        return Redacted.make(
+          JSON.stringify({
+            current: {
+              id: `key-${keyHex.slice(0, 12)}`,
+              keyHex,
+            },
+            previous: [],
+          }),
+        );
+      }),
+    ),
   });
 });

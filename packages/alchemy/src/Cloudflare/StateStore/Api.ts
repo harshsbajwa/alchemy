@@ -31,7 +31,7 @@ export const STATE_STORE_SCRIPT_NAME = "alchemy-state-store" as const;
  * compare against this constant; a mismatch (or 404) triggers a
  * forced redeploy via the bootstrap flow.
  */
-export const STATE_STORE_VERSION = 7 as const;
+export const STATE_STORE_VERSION = 8 as const;
 
 /**
  * Hard-coded OTLP/HTTP endpoints. Point at the public ingest relay
@@ -181,7 +181,7 @@ export default Worker(
           const fqn = decodeURIComponent(params.fqn);
           return store
             .getByName(params.stack)
-            .get({ stage: params.stage, fqn })
+            .get({ stack: params.stack, stage: params.stage, fqn })
             .pipe(
               Effect.withSpan("state_store.getState", {
                 attributes: {
@@ -197,7 +197,12 @@ export default Worker(
           const fqn = decodeURIComponent(params.fqn);
           return store
             .getByName(params.stack)
-            .set({ stage: params.stage, fqn, value: payload as any })
+            .set({
+              stack: params.stack,
+              stage: params.stage,
+              fqn,
+              value: payload as any,
+            })
             .pipe(
               Effect.tap(() =>
                 store
@@ -236,7 +241,10 @@ export default Worker(
         .handle("getReplacedResources", ({ params }) =>
           store
             .getByName(params.stack)
-            .getReplacedResources({ stage: params.stage })
+            .getReplacedResources({
+              stack: params.stack,
+              stage: params.stage,
+            })
             .pipe(
               Effect.withSpan("state_store.getReplacedResources", {
                 attributes: {
@@ -250,7 +258,7 @@ export default Worker(
         .handle("getStackOutput", ({ params }) =>
           store
             .getByName(params.stack)
-            .getOutput({ stage: params.stage })
+            .getOutput({ stack: params.stack, stage: params.stage })
             .pipe(
               Effect.withSpan("state_store.getStackOutput", {
                 attributes: {
@@ -264,7 +272,11 @@ export default Worker(
         .handle("setStackOutput", ({ params, payload }) =>
           store
             .getByName(params.stack)
-            .setOutput({ stage: params.stage, value: payload as any })
+            .setOutput({
+              stack: params.stack,
+              stage: params.stage,
+              value: payload as any,
+            })
             .pipe(
               Effect.tap(() =>
                 store
