@@ -88,6 +88,30 @@ describe("Worker release resources", () => {
           "_redirects",
           "index.mjs",
         ]);
+
+        const changedBinding = yield* prepareWorkerVersionArtifact({
+          worker: "test-worker",
+          artifact: {
+            directory: artifactDirectory,
+            mainModule: "index.mjs",
+          },
+          assets: {
+            directory: assetDirectory,
+            runWorkerFirst: ["/api/*"],
+          },
+          bindings: [
+            {
+              name: "DEPENDENCY",
+              type: "service",
+              service: "changed-dependency-worker",
+            },
+          ],
+          cache: { enabled: true, crossVersionCache: false },
+          placement: { mode: "smart" },
+        });
+        expect(changedBinding.artifactDigest).not.toEqual(
+          prepared.artifactDigest,
+        );
       }).pipe(Effect.provide(PlatformServices)),
   );
 

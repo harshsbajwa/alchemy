@@ -359,11 +359,9 @@ export const WorkerVersionProvider = () =>
       if (output && worker && output.workerId !== worker.workerId) {
         return { action: "replace" } as const;
       }
-      if (
-        output &&
-        typeof news.artifact?.digest === "string" &&
-        news.artifact.digest !== output.artifactDigest
-      ) {
+      if (!output) return;
+      const prepared = yield* prepareWorkerVersionArtifact(news);
+      if (prepared.artifactDigest !== output.artifactDigest) {
         return { action: "replace" } as const;
       }
     }),
