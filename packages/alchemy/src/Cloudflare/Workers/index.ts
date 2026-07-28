@@ -35,5 +35,6 @@ export * from "./WorkerBinding.ts";
 export * from "./WorkerBridge.ts";
 export * from "./WorkerLoader.ts";
 export * from "./WorkerProvider.ts";
+export * from "./WorkerSettings.ts";
 export * from "./WorkerVersion.ts";
 export * from "./WorkersDeployment.ts";
