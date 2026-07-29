@@ -43,6 +43,16 @@ export interface WorkersDeploymentProps {
    */
   baseline?: WorkersDeploymentVersion[];
   /**
+   * Additional exact traffic states that are safe to adopt after state loss.
+   *
+   * This is useful for a serialized gradual rollout where any previously
+   * declared phase may be live when recovery begins. Every candidate baseline
+   * is validated with the same one/two-version and 100-percent invariants as
+   * {@link versions}; an observed deployment outside this allowlist is never
+   * adopted.
+   */
+  recoveryBaselines?: WorkersDeploymentVersion[][];
+  /**
    * Select a particular deployment during recovery. When omitted, the active
    * (latest) deployment is observed.
    */
@@ -215,6 +225,44 @@ const versionsEqual = (
       version.percentage === right[index]?.percentage,
   );
 
+const configuredBaselines = (
+  props: Pick<WorkersDeploymentProps, "baseline" | "recoveryBaselines">,
+): WorkersDeploymentVersion[][] => [
+  ...(props.baseline ? [props.baseline] : []),
+  ...(props.recoveryBaselines ?? []),
+];
+
+export const canonicalWorkersDeploymentBaselines = Effect.fn(function* (
+  baselines: WorkersDeploymentVersion[][],
+) {
+  return yield* Effect.forEach(baselines, canonicalWorkersDeploymentVersions);
+});
+
+export const isKnownWorkersDeploymentBaseline = Effect.fn(function* (
+  baselines: WorkersDeploymentVersion[][],
+  actual: WorkersDeploymentVersionAttributes[],
+) {
+  const expected = yield* canonicalWorkersDeploymentBaselines(baselines);
+  return expected.some((baseline) => versionsEqual(baseline, actual));
+});
+
+const assertKnownBaseline = Effect.fn(function* (
+  props: Pick<WorkersDeploymentProps, "baseline" | "recoveryBaselines">,
+  actual: WorkersDeploymentVersionAttributes[],
+  deploymentId: string,
+  workerName: string,
+) {
+  const baselines = configuredBaselines(props);
+  if (!(yield* isKnownWorkersDeploymentBaseline(baselines, actual))) {
+    const expected = yield* canonicalWorkersDeploymentBaselines(baselines);
+    return yield* new WorkersDeploymentConfigError({
+      message:
+        `Refusing to adopt deployment '${deploymentId}' for '${workerName}': ` +
+        `expected one of ${JSON.stringify(expected)}, observed ${JSON.stringify(actual)}.`,
+    });
+  }
+});
+
 const latestDeployment = Effect.fn(function* (
   accountId: string,
   workerName: string,
@@ -303,7 +351,7 @@ export const WorkersDeploymentProvider = () =>
       // A Worker already has an active deployment after its first upload.
       // Never infer that unknown traffic is safe to replace: recovery needs
       // an explicit baseline and remains gated by normal adoption policy.
-      if (!olds.baseline) return undefined;
+      if (configuredBaselines(olds).length === 0) return undefined;
       const observed = olds.adoptDeploymentId
         ? yield* deploymentById(
             accountId,
@@ -312,15 +360,8 @@ export const WorkersDeploymentProvider = () =>
           )
         : yield* latestDeployment(accountId, worker.workerName);
       if (!observed) return undefined;
-      const expected = yield* canonicalWorkersDeploymentVersions(olds.baseline);
       const actual = canonicalObserved(observed.versions);
-      if (!versionsEqual(expected, actual)) {
-        return yield* new WorkersDeploymentConfigError({
-          message:
-            `Refusing to adopt deployment '${observed.id}' for '${worker.workerName}': ` +
-            `expected baseline ${JSON.stringify(expected)}, observed ${JSON.stringify(actual)}.`,
-        });
-      }
+      yield* assertKnownBaseline(olds, actual, observed.id, worker.workerName);
       return Unowned(toAttributes(observed, accountId, worker, actual));
     }),
 
@@ -351,24 +392,20 @@ export const WorkersDeploymentProvider = () =>
       }
 
       if (!output && observed) {
-        if (!news.baseline) {
+        if (configuredBaselines(news).length === 0) {
           return yield* new WorkersDeploymentConfigError({
             message:
               `Refusing to replace unknown live deployment '${observed.id}' for ` +
-              `'${worker.workerName}'. Provide the exact baseline and adopt it first.`,
+              `'${worker.workerName}'. Provide an exact baseline and adopt it first.`,
           });
         }
-        const expected = yield* canonicalWorkersDeploymentVersions(
-          news.baseline,
-        );
         const actual = canonicalObserved(observed.versions);
-        if (!versionsEqual(expected, actual)) {
-          return yield* new WorkersDeploymentConfigError({
-            message:
-              `Refusing to replace deployment '${observed.id}' for '${worker.workerName}': ` +
-              `expected baseline ${JSON.stringify(expected)}, observed ${JSON.stringify(actual)}.`,
-          });
-        }
+        yield* assertKnownBaseline(
+          news,
+          actual,
+          observed.id,
+          worker.workerName,
+        );
       }
 
       yield* session.note(

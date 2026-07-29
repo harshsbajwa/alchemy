@@ -3,7 +3,9 @@ import {
   prepareWorkerVersionArtifact,
 } from "@/Cloudflare/Workers/WorkerVersion.ts";
 import {
+  canonicalWorkersDeploymentBaselines,
   canonicalWorkersDeploymentVersions,
+  isKnownWorkersDeploymentBaseline,
   WorkersDeploymentConfigError,
 } from "@/Cloudflare/Workers/WorkersDeployment.ts";
 import { PlatformServices } from "@/Util/PlatformServices.ts";
@@ -53,6 +55,64 @@ describe("Worker release resources", () => {
           WorkersDeploymentConfigError,
         );
       }
+    }),
+  );
+
+  it.effect(
+    "canonicalizes every explicitly allowed state-recovery baseline",
+    () =>
+      Effect.gen(function* () {
+        expect(
+          yield* canonicalWorkersDeploymentBaselines([
+            [{ version: "stable", percentage: 100 }],
+            [
+              { version: "stable", percentage: 95 },
+              { version: "candidate", percentage: 5 },
+            ],
+            [
+              { version: "stable", percentage: 0 },
+              { version: "candidate", percentage: 100 },
+            ],
+          ]),
+        ).toEqual([
+          [{ versionId: "stable", percentage: 100 }],
+          [
+            { versionId: "candidate", percentage: 5 },
+            { versionId: "stable", percentage: 95 },
+          ],
+          [
+            { versionId: "candidate", percentage: 100 },
+            { versionId: "stable", percentage: 0 },
+          ],
+        ]);
+      }),
+  );
+
+  it.effect("rejects a live split outside the recovery allowlist", () =>
+    Effect.gen(function* () {
+      const baselines = [
+        [
+          { version: "stable", percentage: 95 },
+          { version: "candidate", percentage: 5 },
+        ],
+        [
+          { version: "stable", percentage: 75 },
+          { version: "candidate", percentage: 25 },
+        ],
+      ];
+
+      expect(
+        yield* isKnownWorkersDeploymentBaseline(baselines, [
+          { versionId: "candidate", percentage: 25 },
+          { versionId: "stable", percentage: 75 },
+        ]),
+      ).toBe(true);
+      expect(
+        yield* isKnownWorkersDeploymentBaseline(baselines, [
+          { versionId: "candidate", percentage: 50 },
+          { versionId: "stable", percentage: 50 },
+        ]),
+      ).toBe(false);
     }),
   );
 
